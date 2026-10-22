@@ -70,6 +70,7 @@
                 ──► solver.set_R_gimbal2world(q)
 ```
 
+- **为什么让它发编码值，而不是直接发欧拉角**：电控端 `GimbalAimReceive_Task` 处理的是增量角 `d = 目标 − 当前`，它自己不维护世界系绝对姿态；但它底层闭环控制的就是 yaw / pitch 两个电机，编码器读数是最原始、最可信的姿态源。而且 `0x106` 本来就在周期性发送，只需要在数据区里带上两个编码值，不用新开帧、不增加总线负载。
 - 新增 `io/cboard_motor_pose_buffer.{hpp,cpp}`，复用 `io::CBoard` 已有的 CAN 后端，不新开设备、不与指令下发争用总线。
 - 编码值 → 角度的换算完全配置化：`motor_yaw_scale` / `motor_pitch_scale` / `motor_yaw_zero` / `motor_pitch_zero` / `motor_yaw_direction` / `motor_pitch_direction`。
   - 实测标定结果：yaw 为 8192 线编码器，`scale = 2π/8192 = 0.00076699 rad/count`（0.0439°/count）；pitch 为整度输出，`scale = π/180`，并实测确认电控 pitch 正方向与云台系 Ry 相反，故 `motor_pitch_direction = -1`。

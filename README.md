@@ -61,7 +61,7 @@
 
 **状态：已完成并实机验证。**
 
-按原设计，云台姿态由 C 板 BMI088 IMU 提供；**当时 IMU 还没接上**（`configs/demo.yaml` 里 `imu_enabled: false`），代码只能退化成单位四元数，等于认为云台一直没转过。改造后姿态直接取自电控回传的 yaw / pitch 电机编码器：
+按原设计，云台姿态由 C 板 BMI088 IMU 提供；但实测imu不可用 （`configs/demo.yaml` 里 `imu_enabled: false`），代码只能退化成单位四元数，等于认为云台一直没转过。改造后姿态直接取自电控回传的 yaw / pitch 电机编码器：
 
 ```
 电控 CAN 0x106 ──► CBoard::callback 按 canid 分流

@@ -215,6 +215,7 @@ make -j$(nproc)
 ### 运行
 
 ```bash
+mkdir -p logs records      # logger 不会自动建目录，缺 logs/ 时首次写日志会抛异常
 ./build/sentry configs/demo.yaml
 ```
 
@@ -244,7 +245,52 @@ make -j$(nproc)
 
 ---
 
-## 6. 已知限制与后续方向
+## 6. 日志与版本管理
+
+### 运行日志
+
+每次启动在**当前工作目录**下新建一个日志文件，文件名即启动时刻：
+
+```
+logs/2026-10-22_23-31-15.log
+```
+
+- 由 `tools/logger.cpp:17` 的 `fmt::format("logs/{:%Y-%m-%d_%H-%M-%S}.log", ...)` 生成，秒级精度；
+- 同时写文件和控制台（彩色），两个 sink 的级别都固定为 `debug`；
+- `flush_on(spdlog::level::info)` ⇒ 崩溃时最多丢掉最后几条 `debug`，`info` 及以上已落盘；
+- **路径是相对路径**，必须在项目根目录启动，否则 `logs/` 会建在别处；
+- `basic_file_sink_mt` 不自动创建目录，所以首次运行前要 `mkdir -p logs`，否则第一次写日志直接抛 `spdlog_ex`。
+
+### 其他运行产物
+
+| 路径 | 内容 | 生成位置 |
+| --- | --- | --- |
+| `logs/<时间戳>.log` | 完整运行日志（info + debug） | `tools/logger.cpp:17` |
+| `records/<时间戳>.avi` + `.txt` | 录制视频与逐帧姿态/时间戳文本 | `tools/recorder.cpp:18-23`（目录自动创建） |
+| `imgs/` | 检测结果出图，仅显式调用 `save()` 时写 | `tasks/auto_aim/yolos/yolov5.cpp:32` |
+| `MvSdkLog/` | 海康 MVS SDK 自身日志 | 相机 SDK |
+
+一键清理：`rm -rf logs records imgs MvSdkLog`。
+
+> **和「按运行编号分目录」的项目的区别**：本项目日志按**启动时刻**命名，一次启动一个文件，没有 `log/runs/<run_id>/` 这种目录层级，也没有用环境变量指定日志根目录。原因是哨兵是单机常驻进程，一次上电即一次会话，时间戳足够唯一定位；需要改落盘位置时，改 `tools/logger.cpp:17` 的格式化字符串即可。
+
+### 版本管理
+
+- 主分支 `main`。
+- `.gitignore` 排除：**构建产物**（`build*/`、`cmake-build-*/`、`CMakeCache.txt`、`*.o`、`*.a`）、**运行产物**（`logs/`、`records/`、`imgs/`、`patterns/`、`MvSdkLog/`、`Camera/`）、**标定输出**（`calibration/output/` 及各 workspace、`*.bag`/`*.db3`/`*.mcap`）、**视频素材**、**厂商 SDK 二进制**（`io/**/lib/**/*.so`）。
+- 模型权重只保留 demo 跑得起来的三份：`assets/yolov5.bin` + `assets/yolov5.xml`（检测）与 `assets/tiny_resnet.onnx`（装甲板类型分类）；`assets/yolo11*`、`assets/yolov8*` 需另行下载。
+- 因此 **clone 后不能直接编译**，缺海康 / 迈德威视 / 达妙的 `.so`（上一节已说明）。这是有意的：厂商 SDK 各有授权，不能跟随 MIT 一并分发。
+- 本仓库是发布用的**干净副本**，不含构建产物、标定图片和二进制历史。开发在本地工作树进行，改完同步到本目录再提交：
+
+```bash
+git add -A
+git commit -m "改了什么"
+git push
+```
+
+---
+
+## 7. 已知限制与后续方向
 
 - **姿态无 roll**：单靠 yaw/pitch 两轴编码器无法还原滚转，底盘大机动时世界系会偏。后续可加一个低成本的 IMU 做 roll 融合（见 `docs/双Yaw轴姿态融合方案.md`）。
 - **EKF 半径状态的过程噪声为 0**：`Target` 的 `Q` 矩阵第 8/9/10 行（`r` / `l` / `h`）全为 0，半径协方差只减不增，一旦被推偏就永久冻结。这是 `diverged()` 误判的根因，目前用阈值放宽规避，没有根治。
@@ -254,7 +300,7 @@ make -j$(nproc)
 
 ---
 
-## 7. 许可
+## 8. 许可
 
 本项目遵循 MIT License，见 [`LICENSE`](LICENSE)。
 
@@ -262,7 +308,7 @@ make -j$(nproc)
 
 ---
 
-## 8. 致谢
+## 9. 致谢
 
 - [TongjiSuperPower/sp_vision_25](https://github.com/TongjiSuperPower/sp_vision_25) —— 整体框架、检测网络、EKF 与规划器算法基础
 - RoboMaster 社区各队开源的检测模型与标定思路

@@ -1,0 +1,21 @@
+dataset:
+  record_duration_s: 100
+  camera_image_hz: 10
+  output_dir_prefix: calibration/output/dataset_
+  preview: true
+
+target:
+  type: checkerboard
+  cols: 8
+  rows: 8
+  grid_size_m: 0.02
+
+camera:
+  config_path: configs/demo.yaml
+
+build:
+  build_dir: build
+
+docker:
+  image: sp-vision-kalibr:cn
+  kalibr_source_dir: /tmp/kalibr-src

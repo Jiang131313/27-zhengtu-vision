@@ -1,0 +1,62 @@
+# ---- 构建产物 ----
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+
+# ---- 运行时产物 ----
+logs/
+*.log
+records/
+records_*/
+imgs/
+patterns/
+Camera/
+MvSdkLog/
+testvideos/
+watchdog.sh
+
+# ---- 标定数据（体积大，不入库）----
+calibration/output/
+calibration/.caliscope_home/
+calibration/.venv/
+calibration/__pycache__/
+calibration/caliscope_workspace/
+calibration/kalibr_workspace/
+*.bag
+*.db3
+*.mcap
+
+# ---- 视频素材 ----
+assets/demo/*.mp4
+assets/demo/*.avi
+assets/demo/build/
+assets/img_with_q/
+
+# ---- 厂商 SDK 二进制：体积大且各有授权，请自行下载安装 ----
+io/**/lib/**/*.so
+io/**/lib/**/*.so.*
+
+# ---- 模型权重：只保留 demo 需要的两个，其余按需下载 ----
+assets/*.onnx
+!assets/tiny_resnet.onnx
+assets/*.bin
+!assets/yolov5.bin
+assets/yolo11*.xml
+assets/yolov8*.xml
+
+# ---- 编辑器 / 工具 ----
+.vscode/
+.idea/
+.codex
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini

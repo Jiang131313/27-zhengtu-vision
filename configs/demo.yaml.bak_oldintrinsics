@@ -1,0 +1,164 @@
+# enemy_color: "red"
+enemy_color: "red"  # 识别目标装甲板颜色，red/blue
+priority_target: "sentry"  # 优先级（当两个兵种同事出现时）hero / three / sentry 
+display : true # 是否显示调试窗口，true/false，正式比赛可以设置为 false 以节省资源，帧率会大大提高
+
+#####-----神经网络参数-----#####
+yolo_name: yolov5
+classify_model: assets/tiny_resnet.onnx
+yolo11_model_path: assets/yolo11.xml
+yolov8_model_path: assets/yolov8.xml
+yolov5_model_path: assets/yolov5.xml
+device: CPU
+min_confidence: 0.8
+use_traditional: true
+
+#输出分辨率为1440x1080
+#####-----ROI-----#####
+roi: 
+  x: 420
+  y: 50
+  width: 600
+  height: 600
+
+use_roi: false
+
+#####-----传统方法参数-----#####
+threshold: 150
+max_angle_error: 45 # degree
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25 # degree
+min_confidence: 0.75
+
+#####-----tracker参数-----#####
+min_detect_count: 5
+max_temp_lost_count: 15
+outpost_max_temp_lost_count: 75
+
+#####-----aimer参数-----#####
+yaw_offset: -1 # degree -2.5
+pitch_offset: -1.4 # degree 2
+comming_angle: 60 # degree
+leaving_angle: 20 # degree
+decision_speed: 8 # rad/s
+high_speed_delay_time: 0.030 # s
+low_speed_delay_time: 0.015 # s
+small_gyro_speed_thresh: 2.5 # rad/s，小陀螺判定阈值
+
+#####-----shooter参数-----#####
+first_tolerance: 5 # 近距离射击容差，degree
+second_tolerance: 4 # 远距离射击容差，degree
+small_gyro_fire_yaw_thresh: 6.0 # degree，小陀螺预测装甲板过枪线开火阈值
+judge_distance: 4 #距离判断阈值
+auto_fire: true # 是否由自瞄控制射击
+use_gimbal_feedback: true # 无 IMU 时 false，仅凭指令稳定判定开火；有 IMU 时 true
+
+camera_name: "hikrobot"
+exposure_ms: 8
+gain: 10
+vid_pid: "2bdf:0001"
+
+#####-----IMU 参数-----#####
+# sentry 主链路从 io/imu_huaner/huaner_pose_buffer.* 读取维特/幻尔协议 IMU。
+# 启动时会自动探测当前波特率，并配置为四元数 200Hz 输出；这里写保存后的目标波特率。
+# /dev/huaner_imu 来自 /etc/udev/rules.d/99-huaner-imu.rules，匹配 CH340(1a86:7523) 并指向幻尔 IMU。
+# 这样换 USB 口时通常还能读到；如果以后再插第二个同款 CH340，需要改成绑定物理 USB 口的 udev 规则。
+imu_enabled: true
+imu_port: "/dev/huaner_imu"
+imu_baudrate: 115200
+# Kalibr 时间偏移：t_imu = t_cam + shift，主程序用图像时间 + shift 查 IMU 姿态。
+imu_time_offset_s: 0.010379616483837785
+
+# 本机相机+IMU联合标定使用的坐标关系；这台 IMU 是横装，所以打开横装刚体链路。
+# 相机/云台前方 = IMU 的 +Y，相机/云台右方 = IMU 的 +X，相机/云台上方 = IMU 的 +Z。
+# （左方 = IMU 的 -X。）IMU 壳子坐标按实际安装标注，2026-06-25 IMU 掉头重装后更新此处。
+# 未配置 imu_horizontal_mount 的旧配置仍走老公式，不影响其他车。
+imu_horizontal_mount: true
+# 矩阵方向是 gimbal 向量 -> imu body 向量。
+R_gimbal2imubody: [0, -1, 0, 1, 0, 0, 0, 0, 1]
+
+# 2026-06-25 19:43 棋盘格+IMU联合标定，1440x1080，重投影误差 0.411px。
+
+camera_matrix: [1734.9116173654709, 0, 693.53522606518425, 0, 1732.0015620346126, 582.45675324679314, 0, 0, 1]
+distort_coeffs: [-0.097371198284898999, 0.19380835564185275, 0.0022799665552142093, -0.0014745011894694911, 0]
+
+# 2026-06-25 19:43 相机+IMU联合标定；Kalibr 输出 T_cam_imu 后按上面的 IMU 坐标关系换到云台系。
+# 换算公式：R_camera2gimbal = (R_gimbal2imubody)^T · (R_cam_imu)^T
+#           t_camera2gimbal = (R_gimbal2imubody)^T · ( -R_cam_imu^T · t_cam_imu )
+# 其中 R_cam_imu / t_cam_imu 取自 Kalibr camchain 的 T_cam_imu。单位是米。
+R_camera2gimbal: [0.00469498, -0.02149918, 0.99975784, -0.99994805, 0.00894473, 0.00488822, -0.00904765, -0.99972885, -0.02145607]
+t_camera2gimbal: [0.009917, 0.00913, -0.034933]
+
+#####-----自瞄输出模式-----#####
+# 枪口发射点在云台坐标系下的位置，单位 m；x 前、y 左、z 上。
+t_muzzle2gimbal: [-0.025374545419175609, -0.061617870636759789, -0.061708289582235745]
+
+#####-----cboard参数-----#####
+can_disabled: false     # fuck.sh 直启 sentry，由 CBoard 直接发送 CAN
+can_send_only: false    # 仅上位机发送给电控，不等待四元数/弹速等反馈（单向通信）
+can_read_imu: false     # sentry 姿态固定从 io/imu_huaner/huaner_pose_buffer.* 读取，不等 CAN 四元数
+can_send_hz: 200.0     # CAN 发送频率（Hz），0 或缺失=按图像帧率发nita送
+can_bitrate: 1000000
+quaternion_canid: 0x100
+bullet_speed_canid: 0x7FF   # 电控实际不发这个格式(0x101 被别的遥测占用)，用不存在的ID屏蔽刷屏
+send_canid: 0x105
+# ---- 云台电机编码姿态（电控 CAN 反馈 -> 四元数）----
+# yaw = 编码值(8192/圈)，pitch = 绝对角度(度，0=相对车水平)
+motor_angle_canid: 0x106
+motor_yaw_zero: 0        # yaw 零点：启动第50帧自动标定
+motor_pitch_zero: 0      # pitch 绝对角度，固定 0
+motor_yaw_scale: 0.00076699    # 2π/8192：编码 -> 弧度
+motor_pitch_scale: 0.01745329  # π/180：度 -> 弧度
+motor_yaw_direction: 1
+motor_pitch_direction: 1
+# "damiao" = 达妙 SDK 直连 DM-USB2FDCAN，无需 slcand；否则填 SocketCAN 接口名如 can0/slcan0
+can_interface: "damiao:sn:14AA044B241402B10DDBDAFE448040BB"
+
+#####-----gimbal参数-----#####
+com_port: "/dev/gimbal"
+
+#####-----planner-----#####
+fire_thresh: 0.003
+
+max_yaw_acc: 50
+Q_yaw: [9e6, 0]
+R_yaw: [1]
+
+max_pitch_acc: 100
+Q_pitch: [9e6,0]
+R_pitch: [1]
+
+#####-----buff_detector参数-----#####
+detect:
+  contrast: 1
+  brightness: 
+    blue: -120
+    red: -100
+  brightness_threshold:
+    blue: 120
+    red: 40
+  morphology_size:
+    blue: 3
+    red: 3
+  dilate_size: 2
+  # canny_low_threshold: 100
+  # canny_high_threshold: 180
+  # approx_epsilon: 1.0
+  R_contours_min_area: 200
+  R_contours_max_area: 600
+  fanblades_head_contours_min_area: 3000
+  fanblades_head_contours_max_area: 8000
+  fanblades_body_contours_min_area: 1000
+  fanblades_body_contours_max_area: 4000
+  standard_fanblade_path: ./assets/standard_fanblade.jpg
+
+#####-----buff_aimer参数-----#####
+aim_time: 0.150         # s
+wait_time: 0.300        # s
+command_fire_gap: 0.080 # s
+predict_time: 0.150     # s

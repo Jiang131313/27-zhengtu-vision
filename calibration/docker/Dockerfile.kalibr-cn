@@ -1,0 +1,50 @@
+FROM osrf/ros:noetic-desktop-full
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    if [ -f /etc/apt/sources.list.d/ros1-latest.list ]; then \
+      sed -i 's|http://packages.ros.org/ros/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros/ubuntu|g; s|http://packages.ros.org/ros-shadow-fixed/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros/ubuntu|g' /etc/apt/sources.list.d/ros1-latest.list; \
+    fi
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    git wget autoconf automake nano patch \
+    python3-dev python3-pip python3-scipy python3-matplotlib \
+    ipython3 python3-wxgtk4.0 python3-tk python3-igraph python3-pyx \
+    libeigen3-dev libboost-all-dev libsuitesparse-dev \
+    doxygen \
+    libopencv-dev \
+    libpoco-dev libtbb-dev libblas-dev liblapack-dev libv4l-dev \
+    python3-catkin-tools python3-osrf-pycommon && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV WORKSPACE=/catkin_ws
+
+RUN mkdir -p "$WORKSPACE/src" && \
+    cd "$WORKSPACE" && \
+    catkin init && \
+    catkin config --extend /opt/ros/noetic && \
+    catkin config --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+ADD . "$WORKSPACE/src/kalibr"
+
+RUN cd "$WORKSPACE/src/kalibr" && patch -p1 < kalibr_sb.patch
+
+RUN cd "$WORKSPACE" && catkin build -j"$(nproc)"
+
+RUN ln -sf /catkin_ws/devel/lib/kalibr/kalibr_* /usr/local/bin/
+
+RUN cat > /kalibr_entrypoint.sh <<'EOF' && chmod +x /kalibr_entrypoint.sh
+#!/usr/bin/env bash
+set -e
+args=("$@")
+set --
+source /opt/ros/noetic/setup.bash
+source /catkin_ws/devel/setup.bash
+export PATH="/catkin_ws/devel/lib/kalibr:${PATH}"
+export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1
+exec "${args[@]}"
+EOF
+
+ENTRYPOINT ["/kalibr_entrypoint.sh"]
+CMD ["bash"]

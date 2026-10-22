@@ -1,0 +1,29 @@
+diff --git a/aslam_cv/aslam_cameras/src/GridCalibrationTargetCheckerboard.cpp b/aslam_cv/aslam_cameras/src/GridCalibrationTargetCheckerboard.cpp
+--- a/aslam_cv/aslam_cameras/src/GridCalibrationTargetCheckerboard.cpp
++++ b/aslam_cv/aslam_cameras/src/GridCalibrationTargetCheckerboard.cpp
+@@ -89,17 +89,16 @@ bool GridCalibrationTargetCheckerboard::computeObservation(
+   // extract the checkerboard corners
+   cv::Size patternSize(cols(), rows());
+   std::vector<cv::Point2f> centers;
+-  bool success = cv::findChessboardCorners(image, patternSize, centers, flags);
+
+-  // 对低对比度或较暗的棋盘图，OpenCV 的 SB 检测通常比旧接口稳定得多。
+-  // 这里保留原有流程，老接口失败时再回退到 SB，尽量不改变原始行为。
+-  if (!success) {
+-    int sbFlags = 0;
+-    if (_options.normalizeImage)
+-      sbFlags += cv::CALIB_CB_NORMALIZE_IMAGE;
+-    success = cv::findChessboardCornersSB(image, patternSize, centers, sbFlags);
+-  }
++  // SB 角点检测更快更稳，优先使用；失败后再回退到旧接口。
++  // sbFlags 与 calibration/calibrate.cpp 预览保持一致：NORMALIZE_IMAGE | EXHAUSTIVE
++  int sbFlags = cv::CALIB_CB_EXHAUSTIVE;
++  if (_options.normalizeImage)
++    sbFlags |= cv::CALIB_CB_NORMALIZE_IMAGE;
++  bool success = cv::findChessboardCornersSB(image, patternSize, centers, sbFlags);
++
++  if (!success)
++    success = cv::findChessboardCorners(image, patternSize, centers, flags);
+
+   // do optional subpixel refinement
+   if (_options.doSubpixelRefinement && success) {

@@ -62,9 +62,17 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   double nis = residual.transpose() * S.inverse() * residual;
   double nees = (x - x_prior).transpose() * P.inverse() * (x - x_prior);
 
-  // 卡方检验阈值（自由度=4，取置信水平95%）
-  constexpr double nis_threshold = 0.711;
-  constexpr double nees_threshold = 0.711;
+  // 卡方检验阈值
+  //   NIS = rᵀ S⁻¹ r，观测量 z 是 4 维（yaw / pitch / distance / angle），
+  //   所以 NIS ~ χ²(4)，它的【均值就是 4】。
+  //   χ²(4) 在 95% 置信度的分位点是 9.488。
+  //   旧值 0.711 是 χ²(4) 的【下尾 5% 分位】（P(χ²(4) < 0.711) ≈ 0.05），
+  //   而判据是 nis > threshold 即算失败 ⇒ 标称上只有 5% 的正常测量能通过。
+  //   NEES 用 11 维全状态协方差，χ²(11) 在 95% 置信度的分位点是 19.675。
+  //   注：当前 R 偏大（update_ypda 给的距离/角度方差很松），NIS 被压得较小，
+  //       旧门限实测其实也没触发；这次是校正统计口径，避免以后收紧 R 时突然失效。
+  constexpr double nis_threshold = 9.488;    // χ²(4)  @95%
+  constexpr double nees_threshold = 19.675;  // χ²(11) @95%
 
   if (nis > nis_threshold) nis_count_++, data["nis_fail"] = 1;
   if (nees > nees_threshold) nees_count_++, data["nees_fail"] = 1;

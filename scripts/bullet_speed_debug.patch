@@ -1,0 +1,620 @@
+diff --git a/configs/demo.yaml b/configs/demo.yaml
+index 8c6793d..7ccf9e8 100644
+--- a/configs/demo.yaml
++++ b/configs/demo.yaml
+@@ -110,6 +110,9 @@ send_canid: 0x105
+ # ---- 云台电机编码姿态（电控 CAN 反馈 -> 四元数）----
+ # yaw = 编码值(8192/圈)，pitch = 绝对角度(度，0=相对车水平)
+ motor_angle_canid: 0x106
++# 电控把弹速塞在 0x106 的第几个字节开始：4 -> data[4..5]，6 -> data[6..7]（当前协议是 6）
++# 量纲(x1/x10/x100)和字节序(大端/小端)代码会自动识别，这里只管位置。
++bullet_speed_byte_offset: 6
+ motor_yaw_zero: 0        # yaw 零点：启动第50帧自动标定
+ motor_pitch_zero: 0      # pitch 绝对角度，固定 0
+ motor_yaw_scale: 0.00076699    # 2π/8192：编码 -> 弧度
+diff --git a/io/cboard.cpp b/io/cboard.cpp
+index 262614a..181ff20 100644
+--- a/io/cboard.cpp
++++ b/io/cboard.cpp
+@@ -16,7 +16,7 @@ namespace io
+ CBoard::CBoard(const std::string & config_path)
+ : mode(Mode::idle),
+   shoot_mode(ShootMode::left_shoot),
+-  bullet_speed(0),
++  bullet_speed(11.0),  // 电控未上报时的默认弹速；收到 0x106 data[6..7] 后会被覆盖
+   queue_(5000),
+   can_(nullptr),
+   can_disabled_(false),
+@@ -153,6 +153,237 @@ void CBoard::send(Command command) const
+   }
+ }
+ 
++namespace
++{
++// 连续多少帧解出的弹速基本一致，才认定这是真弹速（而不是偶尔撞进窗口的杂数据）。
++constexpr std::uint32_t kStableFramesNeeded = 5;
++
++std::int64_t steady_now_ns()
++{
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++           std::chrono::steady_clock::now().time_since_epoch())
++    .count();
++}
++
++// 2 秒滑动窗口算频率：窗口没满就沿用上次算出来的值。
++// 只在 CAN 回调线程调用，所以窗口状态本身不用加锁。
++double update_rate_hz(
++  std::atomic<std::int64_t> & win_ns, std::atomic<std::uint32_t> & win_base, std::uint32_t count,
++  std::int64_t now_ns, double previous_hz)
++{
++  const auto win = win_ns.load(std::memory_order_relaxed);
++  if (win == 0) {
++    win_ns.store(now_ns, std::memory_order_relaxed);
++    win_base.store(count, std::memory_order_relaxed);
++    return previous_hz;
++  }
++  if (now_ns - win < 2000000000LL) return previous_hz;
++
++  const auto base = win_base.load(std::memory_order_relaxed);
++  const auto span = static_cast<double>(now_ns - win);
++  const double hz =
++    span > 0.0 ? static_cast<double>(count - base) * 1e9 / span : previous_hz;
++  win_ns.store(now_ns, std::memory_order_relaxed);
++  win_base.store(count, std::memory_order_relaxed);
++  return hz;
++}
++
++// 把 data[offset..offset+1] 解成 int16，再按 ×1 / ×10 / ×100 三种量纲试出弹速。
++// 三种量纲对应原始值区间互不重叠（8~30 / 80~300 / 800~3000），所以不会有歧义。
++// 大端小端都试：电控用 memcpy 直接把 int16 写进 CAN 帧就会变成小端。
++struct SpeedDecode
++{
++  double speed = -1.0;  // <0 表示这两字节不是弹速
++  double raw = 0.0;     // 原始 int16（按解出结果的那种字节序）
++  double scale = 0.0;   // 1 / 10 / 100
++};
++
++SpeedDecode decode_bullet_speed(const unsigned char * data, int offset, bool little_endian)
++{
++  SpeedDecode out;
++  if (offset < 0 || offset > 6) return out;
++
++  const auto hi = static_cast<std::uint16_t>(data[offset]);
++  const auto lo = static_cast<std::uint16_t>(data[offset + 1]);
++  const auto raw_u = little_endian ? static_cast<std::uint16_t>(hi | (lo << 8))
++                                   : static_cast<std::uint16_t>((hi << 8) | lo);
++  const auto raw = static_cast<int16_t>(raw_u);
++
++  out.raw = static_cast<double>(raw);
++  // 依次按 ×1 / ×10 / ×100 试，落在 8~30 m/s 就认。
++  const double scales[3] = {1.0, 10.0, 100.0};
++  for (const double s : scales) {
++    const double v = static_cast<double>(raw) / s;
++    if (v >= 8.0 && v <= 30.0) {
++      out.speed = v;
++      out.scale = s;
++      return out;
++    }
++  }
++  return out;
++}
++}  // namespace
++
++// 记一次「有效弹速」：只有解析结果落在合理弹速区间才会走到这里。
++// 调试窗口就靠这里的计数/时间戳区分「电控在发弹速」和「没收到、在用默认值」。
++void CBoard::note_bullet_speed(
++  double speed, double raw, int canid, int byte_offset, bool little_endian, double scale)
++{
++  const auto now_ns = steady_now_ns();
++
++  bullet_speed_rx_ns_.store(now_ns, std::memory_order_relaxed);
++  bullet_speed_speed_raw_.store(raw, std::memory_order_relaxed);
++  bullet_speed_src_canid_.store(canid, std::memory_order_relaxed);
++  bullet_speed_byte_offset_used_.store(byte_offset, std::memory_order_relaxed);
++  bullet_speed_little_endian_used_.store(little_endian ? 1 : 0, std::memory_order_relaxed);
++  bullet_speed_scale_used_.store(scale, std::memory_order_relaxed);
++  const auto count = bullet_speed_rx_count_.fetch_add(1, std::memory_order_relaxed) + 1;
++
++  // 约 2 秒滑窗统计接收频率：能看出是稳定在发还是断续丢帧。
++  bullet_speed_rx_hz_.store(
++    update_rate_hz(
++      bullet_speed_win_ns_, bullet_speed_win_base_, count, now_ns,
++      bullet_speed_rx_hz_.load(std::memory_order_relaxed)),
++    std::memory_order_relaxed);
++
++  // 1Hz 打印：把量纲和字节序一起打出来，方便跟电控对协议。
++  static auto last_log = std::chrono::steady_clock::time_point::min();
++  const auto now = std::chrono::steady_clock::now();
++  if (
++    last_log == std::chrono::steady_clock::time_point::min() ||
++    std::chrono::duration<double>(now - last_log).count() >= 1.0) {
++    last_log = now;
++    tools::logger()->info(
++      "[CBoard] bullet_speed RX: raw={} -> {:.2f} m/s (from 0x{:X}, data[{}..{}], {}, x{:.0f})",
++      static_cast<int>(raw), speed, canid, byte_offset, byte_offset + 1,
++      little_endian ? "little-endian" : "big-endian", scale);
++  }
++}
++
++// 收到一帧 0x106：先统计帧本身（证明 CAN 链路和电机姿态是通的），
++// 再解析弹速。yaw/pitch 占了 data[0..3]，弹速在 data[6..7]。
++void CBoard::note_motor_frame(const can_frame & frame)
++{
++  const auto now_ns = steady_now_ns();
++
++  motor_frame_ns_.store(now_ns, std::memory_order_relaxed);
++  const auto frame_count = motor_frame_count_.fetch_add(1, std::memory_order_relaxed) + 1;
++  motor_frame_dlc_.store(static_cast<int>(frame.can_dlc), std::memory_order_relaxed);
++
++  // 0x106 的真实接收频率：电控发多快就是多快，用来和弹速的识别频率对比。
++  motor_frame_hz_.store(
++    update_rate_hz(
++      motor_frame_win_ns_, motor_frame_win_base_, frame_count, now_ns,
++      motor_frame_hz_.load(std::memory_order_relaxed)),
++    std::memory_order_relaxed);
++
++  // 整帧打包成一个 u64 存下来（无锁），窗口那边再拆开显示。
++  std::uint64_t packed = 0;
++  for (int i = 0; i < 8; ++i) {
++    packed |= static_cast<std::uint64_t>(frame.data[i]) << (8 * i);
++  }
++  motor_frame_packed_.store(packed, std::memory_order_relaxed);
++
++  const int offset =
++    (bullet_speed_byte_offset_ >= 0 && bullet_speed_byte_offset_ <= 6) ? bullet_speed_byte_offset_
++                                                                      : 6;
++
++  // ---- 证据 1：这两字节在最近 2s 内的取值范围 ----
++  // 真弹速缓变 -> 范围很窄；计数器之类的遥测 -> 范围很宽。
++  {
++    const int16_t raw_be = static_cast<int16_t>((frame.data[offset] << 8) | frame.data[offset + 1]);
++    const auto raw_win = motor_raw_win_ns_.load(std::memory_order_relaxed);
++    if (raw_win == 0 || now_ns - raw_win >= 2000000000LL) {
++      motor_raw_win_ns_.store(now_ns, std::memory_order_relaxed);
++      motor_raw_min_.store(raw_be, std::memory_order_relaxed);
++      motor_raw_max_.store(raw_be, std::memory_order_relaxed);
++    } else {
++      if (raw_be < motor_raw_min_.load(std::memory_order_relaxed)) {
++        motor_raw_min_.store(raw_be, std::memory_order_relaxed);
++      }
++      if (raw_be > motor_raw_max_.load(std::memory_order_relaxed)) {
++        motor_raw_max_.store(raw_be, std::memory_order_relaxed);
++      }
++    }
++  }
++
++  // 先按大端解（跟 yaw/pitch 一致）；解不出来再试小端。
++  SpeedDecode dec = decode_bullet_speed(frame.data, offset, false);
++  bool little_endian = false;
++  if (dec.speed < 0.0) {
++    const SpeedDecode le = decode_bullet_speed(frame.data, offset, true);
++    if (le.speed > 0.0) {
++      dec = le;
++      little_endian = true;
++    }
++  }
++
++  // ---- 证据 2：连续同值帧数 ----
++  // 弹速是缓变的，连续帧解出来应该基本一样。如果值忽大忽小，说明这两字节
++  // 不是弹速，只是偶尔撞进 8~30 的判定窗口 —— 这就会表现为"一会儿收到一会儿收不到"。
++  if (dec.speed < 0.0) {
++    stable_speed_frames_.store(0, std::memory_order_relaxed);
++    stable_speed_value_.store(0.0, std::memory_order_relaxed);
++    return;  // 这两字节不是弹速，只记帧、不动 bullet_speed
++  }
++  const double prev = stable_speed_value_.load(std::memory_order_relaxed);
++  std::uint32_t stable = 1;
++  if (prev > 0.0 && std::abs(dec.speed - prev) <= 1.0) {
++    stable = stable_speed_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
++  } else {
++    stable_speed_value_.store(dec.speed, std::memory_order_relaxed);
++    stable_speed_frames_.store(1, std::memory_order_relaxed);
++  }
++
++  // 只有连续 kStableFramesNeeded 帧解出来基本一致，才敢当成真弹速用。
++  // 乱跳的帧只记账、不写 bullet_speed —— 否则一次误判就会让弹道解算跟着跳。
++  if (stable >= kStableFramesNeeded) bullet_speed = dec.speed;
++
++  // 不管稳不稳都记一笔接收状态，窗口才能区分"断链"和"值在跳"。
++  note_bullet_speed(dec.speed, dec.raw, motor_angle_canid_, offset, little_endian, dec.scale);
++}
++
++CBoard::BulletSpeedRx CBoard::bullet_speed_rx() const
++{
++  const auto now_ns = steady_now_ns();
++
++  BulletSpeedRx rx;
++  rx.count = bullet_speed_rx_count_.load(std::memory_order_relaxed);
++  rx.ever_received = rx.count > 0;
++  rx.hz = bullet_speed_rx_hz_.load(std::memory_order_relaxed);
++  rx.speed_raw = bullet_speed_speed_raw_.load(std::memory_order_relaxed);
++  rx.src_canid = bullet_speed_src_canid_.load(std::memory_order_relaxed);
++  rx.byte_offset = bullet_speed_byte_offset_used_.load(std::memory_order_relaxed);
++  rx.little_endian = bullet_speed_little_endian_used_.load(std::memory_order_relaxed) != 0;
++  rx.scale = bullet_speed_scale_used_.load(std::memory_order_relaxed);
++  rx.motor_frames = motor_frame_count_.load(std::memory_order_relaxed);
++  rx.motor_hz = motor_frame_hz_.load(std::memory_order_relaxed);
++  rx.raw_min = motor_raw_min_.load(std::memory_order_relaxed);
++  rx.raw_max = motor_raw_max_.load(std::memory_order_relaxed);
++  rx.stable_frames = stable_speed_frames_.load(std::memory_order_relaxed);
++  rx.frame_dlc = motor_frame_dlc_.load(std::memory_order_relaxed);
++  rx.have_frame = rx.motor_frames > 0;
++
++  // 拆出最近一帧 0x106 的原始 8 字节，窗口那边直接显示。
++  const auto packed = motor_frame_packed_.load(std::memory_order_relaxed);
++  for (int i = 0; i < 8; ++i) {
++    rx.frame_bytes[static_cast<std::size_t>(i)] =
++      static_cast<unsigned char>((packed >> (8 * i)) & 0xFF);
++  }
++
++  const auto rx_ns = bullet_speed_rx_ns_.load(std::memory_order_relaxed);
++  if (rx.ever_received && rx_ns > 0) {
++    rx.age_s = static_cast<double>(now_ns - rx_ns) / 1e9;
++  }
++
++  const auto motor_ns = motor_frame_ns_.load(std::memory_order_relaxed);
++  if (rx.motor_frames > 0 && motor_ns > 0) {
++    rx.motor_age_s = static_cast<double>(now_ns - motor_ns) / 1e9;
++  }
++
++  return rx;
++}
++
+ void CBoard::callback(const can_frame & frame)
+ {
+   if (can_send_only_) return;
+@@ -174,11 +405,17 @@ void CBoard::callback(const can_frame & frame)
+   }
+ 
+   else if (frame.can_id == bullet_speed_canid_) {
+-    bullet_speed = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e2;
++    const int16_t speed_raw = static_cast<int16_t>((frame.data[0] << 8) | frame.data[1]);
++    bullet_speed = speed_raw / 1e2;
+     mode = Mode(frame.data[2]);
+     shoot_mode = ShootMode(frame.data[3]);
+     ft_angle = (int16_t)(frame.data[4] << 8 | frame.data[5]) / 1e4;
+ 
++    // 这条链路同样记一笔接收状态，调试窗口不关心电控走的是哪条链路。
++    if (bullet_speed >= 8.0 && bullet_speed <= 30.0) {
++      note_bullet_speed(bullet_speed, static_cast<double>(speed_raw), frame.can_id, 0, false, 100.0);
++    }
++
+     const auto mode_index = static_cast<std::size_t>(mode);
+     const auto shoot_mode_index = static_cast<std::size_t>(shoot_mode);
+     if (mode_index >= MODES.size() || shoot_mode_index >= SHOOT_MODES.size()) {
+@@ -205,6 +442,10 @@ void CBoard::callback(const can_frame & frame)
+   // 电机编码帧 -> 云台姿态（yaw 编码 + pitch 角度），交给 CBoardMotorPoseBuffer
+   if (motor_pose_buffer_ && frame.can_id == motor_angle_canid_) {
+     motor_pose_buffer_->on_motor_angle(frame, timestamp);
++
++    // 电控把弹速搭在 0x106 的最后两个字节 data[6..7]。
++    // note_motor_frame() 里既统计帧数（证明链路通），也解析弹速并记录接收状态。
++    note_motor_frame(frame);
+     return;
+   }
+ }
+@@ -268,6 +509,9 @@ std::string CBoard::read_yaml(const std::string & config_path)
+   quaternion_canid_ = tools::read<int>(yaml, "quaternion_canid");
+   bullet_speed_canid_ = tools::read<int>(yaml, "bullet_speed_canid");
+   send_canid_ = tools::read<int>(yaml, "send_canid");
++  // 电控把弹速放在 0x106 的第几个字节开始（默认 6，即 data[6..7]）
++  bullet_speed_byte_offset_ =
++    yaml["bullet_speed_byte_offset"] ? yaml["bullet_speed_byte_offset"].as<int>() : 6;
+   // 云台电机编码反馈 canid（0 或缺省 = 不用电机姿态）
+   motor_angle_canid_ = yaml["motor_angle_canid"] ? yaml["motor_angle_canid"].as<int>() : 0;
+ 
+diff --git a/io/cboard.hpp b/io/cboard.hpp
+index 69651e8..aa727d5 100644
+--- a/io/cboard.hpp
++++ b/io/cboard.hpp
+@@ -2,8 +2,11 @@
+ #define IO__CBOARD_HPP
+ 
+ #include <Eigen/Geometry>
++#include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <functional>
+ #include <string>
+ #include <vector>
+@@ -47,6 +50,42 @@ public:
+   ShootMode shoot_mode;
+   double ft_angle;  //无人机专有
+ 
++  // ===== 电控弹速接收状态 =====
++  // 现在电控把弹速搭在 0x106（motor_angle_canid）的最后两个字节 data[6..7] 上。
++  // bullet_speed 本身只反映"当前用的值"（收不到就是默认值 11），
++  // 光看它是分不清"电控在发"还是"根本没收到"的，所以额外统计这套接收状态给调试窗口用。
++  struct BulletSpeedRx
++  {
++    bool ever_received = false;      // 开机以来是否收到过合法弹速
++    std::uint32_t count = 0;         // 累计收到多少帧合法弹速
++    double age_s = -1.0;             // 距上次收到多少秒；从未收到为 -1
++    double hz = 0.0;                 // 最近约 2 秒的平均接收频率
++    double speed_raw = -1.0;         // 最近一次认定弹速的原始 int16
++    int src_canid = 0;               // 弹速来自哪个 CAN ID
++    int byte_offset = -1;            // 取自 data[?..?+1]（当前 6）
++    bool little_endian = false;      // 这组值是按大端还是小端解出来的
++    double scale = 0.0;              // 量纲：1 / 10 / 100
++    std::uint32_t motor_frames = 0;  // 累计收到多少帧 0x106（判断 CAN 链路通不通）
++    double motor_age_s = -1.0;       // 距上一帧 0x106 多少秒；从未收到为 -1
++    double motor_hz = 0.0;           // 0x106 的实际接收频率（电控发多快就是多快）
++
++    // 判定"这两字节到底是不是弹速"的两个关键证据：
++    // 真弹速是缓变的，所以 raw 范围很窄（如 1095~1105），且连续很多帧解出的值都一样；
++    // 计数器/别的遥测则是随机跳动，raw 范围很宽，值一直在变。
++    double raw_min = 0.0;             // 最近 2s 内 data[offset..offset+1] 的最小值
++    double raw_max = 0.0;             // 同上最大值
++    std::uint32_t stable_frames = 0;  // 连续多少帧解出的弹速基本一致
++
++    // 最近一帧 0x106 的原始内容：收不到时窗口直接把字节打出来，
++    // 这样能一眼看出电控到底填了什么、量纲/字节序对不对。
++    bool have_frame = false;
++    int frame_dlc = 0;
++    std::array<unsigned char, 8> frame_bytes{};
++  };
++
++  // 取一份接收状态快照（CAN 回调线程写、主线程读，内部用 atomic，可随时调）
++  BulletSpeedRx bullet_speed_rx() const;
++
+   CBoard(const std::string & config_path);
+ 
+   Eigen::Quaterniond imu_at(std::chrono::steady_clock::time_point timestamp);
+@@ -85,6 +124,37 @@ private:
+ 
+   void callback(const can_frame & frame);
+ 
++  // 收到一帧 0x106：存原始帧、统计帧数，并试着从 data[6..7] 解析弹速
++  void note_motor_frame(const can_frame & frame);
++  // 记一次有效弹速（0x106 或 bullet_speed_canid 两条链路共用）
++  void note_bullet_speed(
++    double speed, double raw, int canid, int byte_offset, bool little_endian, double scale);
++
++  // 弹速接收统计（CAN 回调线程写、主线程读，所以都用 atomic）
++  mutable std::atomic<std::int64_t> bullet_speed_rx_ns_{0};
++  mutable std::atomic<std::uint32_t> bullet_speed_rx_count_{0};
++  mutable std::atomic<double> bullet_speed_rx_hz_{0.0};
++  mutable std::atomic<double> bullet_speed_speed_raw_{0.0};
++  mutable std::atomic<int> bullet_speed_src_canid_{0};
++  mutable std::atomic<int> bullet_speed_byte_offset_used_{6};
++  mutable std::atomic<int> bullet_speed_little_endian_used_{0};
++  mutable std::atomic<double> bullet_speed_scale_used_{0.0};
++  mutable std::atomic<std::int64_t> bullet_speed_win_ns_{0};
++  mutable std::atomic<std::uint32_t> bullet_speed_win_base_{0};
++  mutable std::atomic<std::int64_t> motor_frame_ns_{0};
++  mutable std::atomic<std::uint32_t> motor_frame_count_{0};
++  mutable std::atomic<double> motor_frame_hz_{0.0};
++  mutable std::atomic<std::int64_t> motor_frame_win_ns_{0};
++  mutable std::atomic<std::uint32_t> motor_frame_win_base_{0};
++  mutable std::atomic<std::uint64_t> motor_frame_packed_{0};
++  mutable std::atomic<int> motor_frame_dlc_{0};
++  mutable std::atomic<double> motor_raw_min_{0.0};
++  mutable std::atomic<double> motor_raw_max_{0.0};
++  mutable std::atomic<std::int64_t> motor_raw_win_ns_{0};
++  mutable std::atomic<std::uint32_t> stable_speed_frames_{0};
++  mutable std::atomic<double> stable_speed_value_{0.0};
++  int bullet_speed_byte_offset_ = 6;  // 电控把弹速放在 data[?..?+1]；yaml 可配
++
+   std::string read_yaml(const std::string & config_path);
+ 
+   // 把 yaml 里的电机编码参数（zero/scale/direction）喂给 motor_pose_buffer_
+diff --git a/src/sentry/debug_overlay.cpp b/src/sentry/debug_overlay.cpp
+index 9d6b1f9..1278783 100644
+--- a/src/sentry/debug_overlay.cpp
++++ b/src/sentry/debug_overlay.cpp
+@@ -3,7 +3,9 @@
+ #include <fmt/core.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+@@ -86,6 +88,142 @@ void draw_orbit(
+   }
+ }
+ 
++// 电控弹速接收状态：把"收没收到"做成一眼可辨的三态。
++// 只看 bullet_speed 数值是不够的 —— 收不到时它是构造函数里的默认值 11，
++// 和真实弹速长得一模一样，所以这里额外用接收计数 + 时间戳来判定。
++struct BulletSpeedStatus
++{
++  bool ok = false;  // 正在稳定收到
++  bool stale = false;  // 收到过，但最近断了
++  std::string text;   // 三态文字
++  std::string detail;  // 第一行定位信息
++  std::string detail2;  // 第二行：原始字节 / 各种解法（收不到时才有）
++  std::string short_detail;  // 面板里用的一行摘要
++  std::string value_suffix;  // 跟在数值后面的说明：真值 / 默认值 / 跳变值
++  cv::Scalar color;
++};
++
++// 把 data[offset..offset+1] 按指定字节序解成 int16，并给出它对应多少 m/s。
++// 纯显示用，顺序和 CBoard::decode_bullet_speed() 保持一致（×1 / ×10 / ×100）。
++std::string describe_bytes(
++  const std::array<unsigned char, 8> & b, int dlc, int offset, bool little_endian)
++{
++  if (offset < 0 || offset > 6) return "--";
++  if (dlc > 0 && offset + 1 >= dlc) return fmt::format("data[{}..{}] beyond dlc={}", offset,
++                                                       offset + 1, dlc);
++
++  const auto hi = static_cast<std::uint16_t>(b[static_cast<std::size_t>(offset)]);
++  const auto lo = static_cast<std::uint16_t>(b[static_cast<std::size_t>(offset + 1)]);
++  const auto raw_u = little_endian ? static_cast<std::uint16_t>(hi | (lo << 8))
++                                   : static_cast<std::uint16_t>((hi << 8) | lo);
++  const auto raw = static_cast<int16_t>(raw_u);
++
++  const std::string tag = fmt::format("0x{:04X}={}", static_cast<unsigned>(raw_u),
++                                      static_cast<int>(raw));
++  const double scales[3] = {1.0, 10.0, 100.0};
++  for (const double sc : scales) {
++    const double v = static_cast<double>(raw) / sc;
++    if (v >= 8.0 && v <= 30.0) {
++      return fmt::format("{} -> {:.1f} m/s (x{:.0f})", tag, v, sc);
++    }
++  }
++  return fmt::format("{} -> not a speed", tag);
++}
++
++std::string hex_dump(const std::array<unsigned char, 8> & b, int dlc)
++{
++  std::string out;
++  for (int i = 0; i < 8; ++i) {
++    if (dlc > 0 && i >= dlc) {
++      out += "-- ";
++    } else {
++      out += fmt::format("{:02X} ", b[static_cast<std::size_t>(i)]);
++    }
++  }
++  return out;
++}
++
++BulletSpeedStatus make_bullet_speed_status(const DebugOverlayInput & input)
++{
++  const auto & rx = input.bullet_speed_rx;
++  const int offset = rx.byte_offset >= 0 ? rx.byte_offset : 6;
++  BulletSpeedStatus s;
++
++  // 0x106 一般几百 Hz，超过 0.5s 没更新就认为断了。
++  constexpr double fresh_s = 0.5;
++  const bool fresh = rx.ever_received && rx.age_s >= 0.0 && rx.age_s <= fresh_s;
++  // 光"这一帧能解出数"不够：弹速是缓变的，必须连续好几帧解出来都一样才算真收到。
++  // 如果值一直在跳（stable 很小），说明这两字节根本不是弹速，
++  // 只是偶尔撞进 8~30 的判定窗口 —— 表现就是"一会儿收到一会儿收不到"。
++  constexpr std::uint32_t stable_needed = 5;
++  s.ok = fresh && rx.stable_frames >= stable_needed;
++  s.stale = rx.ever_received && !fresh;
++
++  if (s.ok) {
++    s.text = "RX OK";
++    s.value_suffix = "   <- from EC";
++    s.color = cv::Scalar(0, 255, 0);  // 绿：正在稳定收到
++  } else if (fresh) {
++    s.text = "UNSTABLE";
++    s.value_suffix = "   (flapping, NOT from EC)";
++    s.color = cv::Scalar(0, 165, 255);  // 橙：能解出数但值在跳，不是弹速
++  } else if (s.stale) {
++    s.text = fmt::format("RX LOST {:.1f}s", rx.age_s);
++    s.value_suffix = "   (stale, last known)";
++    s.color = cv::Scalar(0, 165, 255);  // 橙：以前有，现在断了
++  } else {
++    s.text = "NOT RECEIVED";
++    s.value_suffix = "   (DEFAULT 11.0, NOT from EC)";
++    s.color = cv::Scalar(0, 0, 255);  // 红：从来没收到过
++  }
++
++  // 两个频率放一起看最有用：
++  //   0x106 Hz = 电控发过来的帧率（链路在不在、发多快）
++  //   speed Hz = 其中有几帧真的带着能认出来的弹速
++  // 两者相等 -> 每帧都带弹速；0x106 高而 speed 低 -> 帧在发但这两字节不是弹速。
++  s.short_detail = fmt::format(
++    "0x106 {:.0f}Hz / speed {:.0f}Hz  raw[{}] n={}", rx.motor_hz, rx.hz,
++    fmt::format("{}..{}", static_cast<int>(rx.raw_min), static_cast<int>(rx.raw_max)), rx.count);
++
++  // 这两字节的取值范围是最硬的证据：真弹速范围很窄，计数器之类的会铺满整个范围。
++  const std::string range_text = fmt::format(
++    "raw[{}..{}]", static_cast<int>(rx.raw_min), static_cast<int>(rx.raw_max));
++
++  if (s.ok) {
++    // 收到时把"从哪两个字节、按什么字节序、什么量纲解出来的"标清楚，
++    // 免得看到一个数字却不知道它可不可信。
++    s.detail = fmt::format(
++      "raw={} = {:.2f} m/s  [data[{}..{}] {} x{:.0f}]   stable {} frames  {:.2f}s ago",
++      static_cast<int>(rx.speed_raw), input.bullet_speed, offset, offset + 1,
++      rx.little_endian ? "LE" : "BE", rx.scale, rx.stable_frames, rx.age_s);
++    s.detail2 = fmt::format(
++      "0x106 {:.1f}Hz -> speed {:.1f}Hz   {}   dlc={}  bytes: {}", rx.motor_hz, rx.hz, range_text,
++      rx.frame_dlc, hex_dump(rx.frame_bytes, rx.frame_dlc));
++  } else if (fresh) {
++    // 能解出数但一直在跳：基本可以断定这两字节不是弹速。
++    s.detail = fmt::format(
++      "value keeps changing (stable {} frames) -> data[{}..{}] is NOT a bullet speed field",
++      rx.stable_frames, offset, offset + 1);
++    s.detail2 = fmt::format(
++      "0x106 {:.1f}Hz, speed matched {:.1f}Hz, {}   bytes: {}", rx.motor_hz, rx.hz, range_text,
++      hex_dump(rx.frame_bytes, rx.frame_dlc));
++  } else if (rx.have_frame) {
++    // CAN 通着、0x106 在收，只是这两字节没被认成弹速 —— 把原始内容摊开，
++    // 直接看电控填了什么、是量纲不对还是字节序不对。
++    s.detail = fmt::format(
++      "0x106 {:.1f}Hz (n={}, {:.2f}s ago, dlc={}) but data[{}..{}] not recognised as a speed",
++      rx.motor_hz, rx.motor_frames, rx.motor_age_s, rx.frame_dlc, offset, offset + 1);
++    s.detail2 = fmt::format(
++      "{}   bytes: {}  |  BE {}  |  LE {}", range_text, hex_dump(rx.frame_bytes, rx.frame_dlc),
++      describe_bytes(rx.frame_bytes, rx.frame_dlc, offset, false),
++      describe_bytes(rx.frame_bytes, rx.frame_dlc, offset, true));
++  } else {
++    s.detail = "no 0x106 frame at all: check motor_angle_canid / CAN link / EC power";
++  }
++
++  return s;
++}
++
+ void draw_text_panel(cv::Mat & vis, const DebugOverlayInput & input)
+ {
+   int line_h = 28;
+@@ -203,9 +341,14 @@ void draw_text_panel(cv::Mat & vis, const DebugOverlayInput & input)
+   // ----- 火控：control=aim 成功；shoot=control 且 Shooter 判定可开火 -----
+   tools::draw_text(vis, "Fire control:", {10, y0}, {0, 255, 255}, 0.7);
+   y0 += line_h;
++  // 弹速这一行带上接收状态：绿=在收，橙=断了，红=从没收到。
++  const auto bullet_status = make_bullet_speed_status(input);
+   tools::draw_text(
+-    vis, fmt::format("  bullet_speed: {:.1f}  mode: {}", input.bullet_speed, io::MODES[input.mode]),
+-    {10, y0}, {255, 255, 255}, 0.6);
++    vis,
++    fmt::format(
++      "  bullet: {:.2f} m/s  [{}]  {}  mode: {}", input.bullet_speed, bullet_status.text,
++      bullet_status.short_detail, io::MODES[input.mode]),
++    {10, y0}, bullet_status.color, 0.6);
+   y0 += line_h;
+   tools::draw_text(
+     vis,
+@@ -314,6 +457,18 @@ bool show_debug_overlay(
+       "control {}   shoot {}", input.command.control ? 1 : 0, input.command.shoot ? 1 : 0),
+     {40, 235}, {200, 200, 200}, 0.8, 2);
+ 
++  // ===== 电控弹速接收状态（醒目三态）=====
++  // 绿 [RX OK]       = 电控正在发，数值可信
++  // 橙 [RX LOST x.xs]= 以前收到过，现在断了，数值是旧的
++  // 红 [NOT RECEIVED]= 从没收到，显示的 11 m/s 是代码里的默认值（不是电控的）
++  const auto bs = make_bullet_speed_status(input);
++  const std::string bullet_text =
++    fmt::format("BULLET {:.2f} m/s{}", input.bullet_speed, bs.value_suffix);
++  tools::draw_text(vis, fmt::format("{}   [{}]", bullet_text, bs.text), {40, 295}, bs.color, 1.2, 3);
++  tools::draw_text(vis, bs.detail, {40, 340}, {200, 200, 200}, 0.7, 2);
++  if (!bs.detail2.empty()) {
++    tools::draw_text(vis, bs.detail2, {40, 375}, {200, 200, 200}, 0.7, 2);
++  }
+ 
+   cv::namedWindow("auto_aim", cv::WINDOW_NORMAL);
+   cv::resizeWindow("auto_aim", 800, 600);
+diff --git a/src/sentry/debug_overlay.hpp b/src/sentry/debug_overlay.hpp
+index a46b557..ba5c532 100644
+--- a/src/sentry/debug_overlay.hpp
++++ b/src/sentry/debug_overlay.hpp
+@@ -21,6 +21,8 @@ struct DebugOverlayInput
+ {
+   int frame_count = 0;
+   double bullet_speed = 0.0;
++  // 电控弹速接收状态：用来判断"到底收没收到弹速"，而不是只看一个数值。
++  io::CBoard::BulletSpeedRx bullet_speed_rx;
+   io::Mode mode = io::Mode::idle;
+   std::size_t armors_before_tracker = 0;
+   std::size_t armors_after_tracker = 0;
+diff --git a/src/sentry/main.cpp b/src/sentry/main.cpp
+index 5538094..150b6d9 100644
+--- a/src/sentry/main.cpp
++++ b/src/sentry/main.cpp
+@@ -132,6 +132,7 @@ int main(int argc, char * argv[])
+       const sentry_app::DebugOverlayInput debug_input{
+         frame_count,
+         cboard.bullet_speed,
++        cboard.bullet_speed_rx(),  // 电控弹速接收状态（0x106 最后两字节）
+         mode,
+         armors_before_tracker,
+         armors_after_tracker,

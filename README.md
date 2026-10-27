@@ -171,6 +171,7 @@ calibration/          相机内参与手眼标定工具
 assets/               检测模型（yolov5 IR + 分类网络）与标定参数
 docs/                 设计文档、改进说明、调试记录、原队伍开源说明
 deploy/               开机自启项（sp_vision.desktop）
+scripts/              调试期间用的运维脚本（设备自检、快照/回滚、watchdog 测试）
 ```
 
 ---

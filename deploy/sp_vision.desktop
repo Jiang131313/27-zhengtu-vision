@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=sp_vision
+Comment=sp_vision autostart (watchdog wrapper, retries on DamiaoCAN USB re-enum crash)
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+
+# 等待图形会话/设备初始化，避免 -d 窗口启动失败
+X-GNOME-Autostart-Delay=5
+
+# 固定工作目录，确保相对路径配置/资源可用
+Path=/home/lab/Desktop/sp_vision_25_hero
+
+# 守护脚本: 启动失败自动重试(USB SN 未就绪窗口), 日志 20MB 自动轮转
+Exec=/home/lab/Desktop/sp_vision_25_hero/autostart_sentry.sh
